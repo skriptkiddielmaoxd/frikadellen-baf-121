@@ -284,10 +284,11 @@ async fn main() -> Result<()> {
                         let _ = ws.send_message(&scoreboard_msg).await;
                         let _ = ws.send_message(&tab_msg).await;
                     });
-                    // Queue claim
+                    // Queue claim at Normal priority so any pending High-priority flip
+                    // purchases run before we open the AH windows to collect.
                     command_queue_clone.enqueue(
                         frikadellen_baf::types::CommandType::ClaimPurchasedItem,
-                        frikadellen_baf::types::CommandPriority::High,
+                        frikadellen_baf::types::CommandPriority::Normal,
                         false,
                     );
                     // Look up stored flip data and update with real buy price + purchase time.
@@ -327,8 +328,9 @@ async fn main() -> Result<()> {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
+                        let purse = bot_client_clone.get_purse();
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_purchased(&name, &item, price, opt_target, opt_profit, &url).await;
+                            frikadellen_baf::webhook::send_webhook_item_purchased(&name, &item, price, opt_target, opt_profit, purse, &url).await;
                         });
                     }
                 }
@@ -377,8 +379,9 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let b = buyer.clone();
+                        let purse = bot_client_clone.get_purse();
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_sold(&name, &item, price, &b, opt_profit, opt_time_secs, &url).await;
+                            frikadellen_baf::webhook::send_webhook_item_sold(&name, &item, price, &b, opt_profit, opt_time_secs, purse, &url).await;
                         });
                     }
                 }
@@ -393,9 +396,27 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let total = price_per_unit * amount as f64;
+                        let purse = bot_client_clone.get_purse();
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_bazaar_order_placed(
-                                &name, &item, amount, price_per_unit, total, is_buy_order, &url,
+                                &name, &item, amount, price_per_unit, total, is_buy_order, purse, &url,
+                            ).await;
+                        });
+                    }
+                }
+                frikadellen_baf::bot::BotEvent::AuctionListed { item_name, starting_bid, duration_hours } => {
+                    print_mc_chat(&format!(
+                        "§f[§4BAF§f]: §a🏷️ BIN listed: §r{} §7@ §6{}§7 coins for §e{}h",
+                        item_name, format_coins(starting_bid as i64), duration_hours
+                    ));
+                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                        let url = webhook_url.to_string();
+                        let name = ingame_name_for_events.clone();
+                        let item = item_name.clone();
+                        let purse = bot_client_clone.get_purse();
+                        tokio::spawn(async move {
+                            frikadellen_baf::webhook::send_webhook_auction_listed(
+                                &name, &item, starting_bid, duration_hours, purse, &url,
                             ).await;
                         });
                     }
