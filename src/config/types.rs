@@ -42,6 +42,11 @@ pub struct Config {
     
     #[serde(default)]
     pub auto_cookie: u64,
+
+    /// Send slot-31 twice on BIN Auction View to skip the Confirm Purchase dialog.
+    /// Defaults to false. Enable with caution — rapid double-click may look suspicious.
+    #[serde(default)]
+    pub confirm_skip: bool,
     
     #[serde(default = "default_true")]
     pub enable_console_input: bool,
@@ -172,6 +177,7 @@ impl Default for Config {
             bed_spam: false,
             use_cofl_chat: true,
             auto_cookie: 0,
+            confirm_skip: false,
             enable_console_input: true,
             auction_duration_hours: default_auction_duration_hours(),
             skip: SkipConfig::default(),
@@ -179,7 +185,7 @@ impl Default for Config {
             proxy: None,
             proxy_username: None,
             proxy_password: None,
-            webhook_url: Some(String::new()),
+            webhook_url: None,
             web_gui_password: None,
             accounts: None,
             auto_switching: None,

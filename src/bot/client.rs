@@ -79,6 +79,8 @@ pub struct BotClient {
     sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
+    /// Whether to use the confirm-skip technique when purchasing BIN auctions
+    pub confirm_skip: bool,
 }
 
 /// Events that can be emitted by the bot
@@ -131,6 +133,7 @@ impl BotClient {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
+            confirm_skip: false,
         }
     }
 
@@ -201,6 +204,7 @@ impl BotClient {
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
+            confirm_skip: self.confirm_skip,
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -508,6 +512,8 @@ pub struct BotClientState {
     pub sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
+    /// Whether to use the confirm-skip technique when purchasing BIN auctions
+    pub confirm_skip: bool,
 }
 
 impl Default for BotClientState {
@@ -541,6 +547,7 @@ impl Default for BotClientState {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
+            confirm_skip: false,
         }
     }
 }
@@ -559,15 +566,18 @@ fn remove_mc_colors(s: &str) -> String {
     result
 }
 
-/// Get the display name of an item slot as a plain string (no color codes)
+/// Get the display name of an item slot as a plain string (no color codes).
+/// Checks `minecraft:custom_name` first (custom-named items), then falls back
+/// to `minecraft:item_name` (base item name override used by some Hypixel GUI items).
 fn get_item_display_name_from_slot(item: &azalea_inventory::ItemStack) -> Option<String> {
     if let Some(item_data) = item.as_present() {
         if let Ok(value) = serde_json::to_value(item_data) {
-            // Try components["minecraft:custom_name"]
-            if let Some(name_val) = value
-                .get("components")
+            let components = value.get("components");
+            // Try minecraft:custom_name first, then minecraft:item_name as fallback
+            let name_val = components
                 .and_then(|c| c.get("minecraft:custom_name"))
-            {
+                .or_else(|| components.and_then(|c| c.get("minecraft:item_name")));
+            if let Some(name_val) = name_val {
                 let raw = if name_val.is_string() {
                     name_val.as_str().unwrap_or("").to_string()
                 } else {
@@ -1325,23 +1335,21 @@ async fn handle_window_interaction(
     
     match bot_state {
         BotState::Purchasing => {
-            // Handle auction house windows
             if window_title.contains("BIN Auction View") {
-                info!("BIN Auction View opened - clicking purchase button (slot 31)");
-                // Click slot 31 (purchase button)
-                click_window_slot(bot, window_id, 31).await;
-                
-                // Wait a bit for confirmation window to open
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                if state.confirm_skip {
+                    // Confirm-skip: send slot 31 twice (~one tick apart).
+                    // The second packet skips the Confirm Purchase dialog entirely.
+                    click_window_slot(bot, window_id, 31).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    click_window_slot(bot, window_id, 31).await;
+                    *state.bot_state.write() = BotState::Idle;
+                } else {
+                    // Normal flow: click Buy and wait for the Confirm Purchase window.
+                    click_window_slot(bot, window_id, 31).await;
+                }
             } else if window_title.contains("Confirm Purchase") {
-                info!("Confirm Purchase window opened - clicking confirm button (slot 11)");
-                // Click slot 11 (confirm button)
+                // Only reached when confirm_skip is disabled.
                 click_window_slot(bot, window_id, 11).await;
-                
-                // Wait a bit for purchase to complete
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                
-                // Purchase complete, go back to idle
                 *state.bot_state.write() = BotState::Idle;
             }
         }
