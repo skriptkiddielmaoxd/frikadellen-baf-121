@@ -1328,23 +1328,14 @@ async fn handle_window_interaction(
     
     match bot_state {
         BotState::Purchasing => {
-            // Handle auction house windows
+            // Confirm-skip technique: send slot 31 twice on the same BIN Auction View window.
+            // The second packet acts as the confirmation, skipping the "Confirm Purchase" dialog
+            // entirely.  This matches how other Hypixel macros implement confirm-skip and avoids
+            // the race condition where the Confirm Purchase window opens on a stale window ID.
             if window_title.contains("BIN Auction View") {
-                info!("BIN Auction View opened - clicking purchase button (slot 31)");
-                // Click slot 31 (purchase button)
                 click_window_slot(bot, window_id, 31).await;
-                
-                // Wait a bit for confirmation window to open
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            } else if window_title.contains("Confirm Purchase") {
-                info!("Confirm Purchase window opened - clicking confirm button (slot 11)");
-                // Click slot 11 (confirm button)
-                click_window_slot(bot, window_id, 11).await;
-                
-                // Wait a bit for purchase to complete
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                
-                // Purchase complete, go back to idle
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                click_window_slot(bot, window_id, 31).await;
                 *state.bot_state.write() = BotState::Idle;
             }
         }
