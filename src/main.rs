@@ -52,6 +52,25 @@ async fn main() -> Result<()> {
         config_loader.save(&config)?;
     }
 
+    // Prompt for webhook URL if not yet configured (matches TypeScript configHelper.ts pattern
+    // of adding new default values to existing config on first run of newer version)
+    if config.webhook_url.is_none() {
+        let wants_webhook = Confirm::new()
+            .with_prompt("Configure Discord webhook for notifications? (optional)")
+            .default(false)
+            .interact()?;
+        if wants_webhook {
+            let url: String = Input::new()
+                .with_prompt("Enter Discord webhook URL")
+                .interact_text()?;
+            config.webhook_url = Some(url);
+        } else {
+            // Mark as configured (empty = disabled) so we don't ask again
+            config.webhook_url = Some(String::new());
+        }
+        config_loader.save(&config)?;
+    }
+
     let ingame_name = config.ingame_name.clone().unwrap();
     
     info!("Configuration loaded for player: {}", ingame_name);
@@ -458,6 +477,9 @@ async fn main() -> Result<()> {
                             let item_raw = auction_data.get("itemName").and_then(|v| v.as_str());
                             let price = auction_data.get("price").and_then(|v| v.as_u64());
                             let duration = auction_data.get("duration").and_then(|v| v.as_u64());
+                            // Also extract slot (mineflayer inventory slot 9-44) and id
+                            let item_slot = auction_data.get("slot").and_then(|v| v.as_u64());
+                            let item_id = auction_data.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
                             match (item_raw, price, duration) {
                                 (Some(item_raw), Some(price), Some(duration)) => {
                                     // Strip Minecraft color codes (§X) from item name
@@ -467,6 +489,8 @@ async fn main() -> Result<()> {
                                             item_name,
                                             starting_bid: price,
                                             duration_hours: duration,
+                                            item_slot,
+                                            item_id,
                                         },
                                         CommandPriority::High,
                                         false,
@@ -556,6 +580,10 @@ async fn main() -> Result<()> {
                     frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
                     | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
                 );
+                let is_selling = matches!(
+                    cmd.command_type,
+                    frikadellen_baf::types::CommandType::SellToAuction { .. }
+                );
                 if is_claim {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     loop {
@@ -574,6 +602,18 @@ async fn main() -> Result<()> {
                         sleep(Duration::from_millis(250)).await;
                         let s = bot_client_clone.state();
                         if s != frikadellen_baf::types::BotState::Bazaar
+                            || std::time::Instant::now() >= deadline
+                        {
+                            break;
+                        }
+                    }
+                } else if is_selling {
+                    // Wait up to 60s for the full auction creation flow to complete
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    loop {
+                        sleep(Duration::from_millis(250)).await;
+                        let s = bot_client_clone.state();
+                        if s != frikadellen_baf::types::BotState::Selling
                             || std::time::Instant::now() >= deadline
                         {
                             break;
