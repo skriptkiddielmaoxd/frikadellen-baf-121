@@ -65,6 +65,10 @@ pub struct Config {
     pub proxy_password: Option<String>,
     
     #[serde(default)]
+    /// Discord webhook URL for notifications.
+    /// `None` = not yet configured (prompts on next startup).
+    /// `Some("")` = explicitly disabled (no further prompts).
+    /// `Some(url)` = active webhook.
     pub webhook_url: Option<String>,
     
     #[serde(default)]

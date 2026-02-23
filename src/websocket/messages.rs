@@ -30,10 +30,17 @@ pub fn parse_message_data<T: for<'de> Deserialize<'de>>(data: &str) -> Result<T,
 }
 
 /// Inject referral ID into Coflnet authentication URLs
-/// This adds the referral ID "9KKPN9" before the connection ID parameter
+/// This adds the referral ID "9KKPN9" before the connection ID parameter.
+/// Handles both HTML-encoded (&amp;) and plain (&) URL formats.
 pub fn inject_referral_id(url: &str) -> String {
-    if url.contains("sky.coflnet.com/authmod?") && !url.contains("refId=") {
-        url.replace("&amp;conId=", "&amp;refId=9KKPN9&amp;conId=")
+    if url.contains("sky.coflnet.com") && !url.contains("refId=") {
+        // Try HTML-encoded form first
+        let result = url.replace("&amp;conId=", "&amp;refId=9KKPN9&amp;conId=");
+        if result != url {
+            return result;
+        }
+        // Fall back to plain & form
+        url.replace("&conId=", "&refId=9KKPN9&conId=")
     } else {
         url.to_string()
     }

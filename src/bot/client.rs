@@ -22,8 +22,8 @@ use super::handlers::BotEventHandlers;
 /// Connection wait duration (seconds) - time to wait for bot connection to establish
 const CONNECTION_WAIT_SECONDS: u64 = 2;
 
-/// Delay after spawning in lobby before sending /play skyblock command
-const LOBBY_COMMAND_DELAY_SECS: u64 = 1;
+/// Delay after spawning in lobby before sending /play sb command
+const LOBBY_COMMAND_DELAY_SECS: u64 = 3;
 
 /// Delay after detecting SkyBlock join before teleporting to island
 const ISLAND_TELEPORT_DELAY_SECS: u64 = 2;
@@ -192,6 +192,12 @@ impl BotClient {
             bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
             bazaar_is_buy_order: Arc::new(RwLock::new(true)),
             bazaar_step: Arc::new(RwLock::new(BazaarStep::Initial)),
+            auction_item_name: Arc::new(RwLock::new(String::new())),
+            auction_starting_bid: Arc::new(RwLock::new(0)),
+            auction_duration_hours: Arc::new(RwLock::new(24)),
+            auction_item_slot: Arc::new(RwLock::new(None)),
+            auction_item_id: Arc::new(RwLock::new(None)),
+            auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
@@ -422,8 +428,23 @@ impl Default for BotClient {
     }
 }
 
-/// Which step of the bazaar order-placement flow the bot is in.
-/// Matches TypeScript's `currentStep` variable in placeBazaarOrder().
+/// Which step of the auction creation flow the bot is in.
+/// Matches TypeScript's setPrice/durationSet flags in sellHandler.ts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuctionStep {
+    #[default]
+    Initial,       // Just sent /ah, waiting for "Auction House"
+    OpenManage,    // Clicked slot 15 in AH, waiting for "Manage Auctions"
+    ClickCreate,   // Clicked "Create Auction" in Manage Auctions, waiting for "Create Auction"
+    SelectBIN,     // Clicked slot 48 in "Create Auction", waiting for "Create BIN Auction"
+    PriceSign,     // Clicked item + slot 31, sign expected (setPrice=false in TS)
+    SetDuration,   // Price sign done; "Create BIN Auction" second visit → click slot 33
+    DurationSign,  // "Auction Duration" opened + slot 16 clicked; sign expected for duration
+    ConfirmSell,   // Duration sign done; "Create BIN Auction" third visit → click slot 29
+    FinalConfirm,  // In "Confirm BIN Auction" → click slot 11
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BazaarStep {
     #[default]
@@ -468,6 +489,19 @@ pub struct BotClientState {
     pub bazaar_is_buy_order: Arc<RwLock<bool>>,
     /// Which step of the bazaar flow we're in
     pub bazaar_step: Arc<RwLock<BazaarStep>>,
+    // ---- Auction creation context (set in execute_command, read in window/sign handlers) ----
+    /// Item name for current auction listing
+    pub auction_item_name: Arc<RwLock<String>>,
+    /// Starting bid for current auction
+    pub auction_starting_bid: Arc<RwLock<u64>>,
+    /// Duration in hours for current auction
+    pub auction_duration_hours: Arc<RwLock<u64>>,
+    /// Mineflayer inventory slot (9-44) for item to auction
+    pub auction_item_slot: Arc<RwLock<Option<u64>>>,
+    /// ExtraAttributes.id of item to auction (for identity verification)
+    pub auction_item_id: Arc<RwLock<Option<String>>>,
+    /// Which step of the auction creation flow we're in
+    pub auction_step: Arc<RwLock<AuctionStep>>,
     /// Scoreboard scores: objective_name -> (owner -> (display_text, score))
     pub scoreboard_scores: Arc<RwLock<HashMap<String, HashMap<String, (String, u32)>>>>,
     /// Which objective is currently displayed in the sidebar slot
@@ -498,6 +532,12 @@ impl Default for BotClientState {
             bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
             bazaar_is_buy_order: Arc::new(RwLock::new(true)),
             bazaar_step: Arc::new(RwLock::new(BazaarStep::Initial)),
+            auction_item_name: Arc::new(RwLock::new(String::new())),
+            auction_starting_bid: Arc::new(RwLock::new(0)),
+            auction_duration_hours: Arc::new(RwLock::new(24)),
+            auction_item_slot: Arc::new(RwLock::new(None)),
+            auction_item_id: Arc::new(RwLock::new(None)),
+            auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
@@ -672,7 +712,10 @@ async fn event_handler(
                         warn!("[Startup] 30-second watchdog: forcing startup completion");
                         *joined_wd.write() = true;
                         *teleported_wd.write() = true;
-                        tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
+                        // Retry /play sb in case the initial attempt failed (lobby not ready)
+                        bot_wd.write_chat_packet("/play sb");
+                        // Wait for SkyBlock to load (5s) + island teleport delay combined
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
                         info!("[Startup] Watchdog: state → Idle, bot ready to flip");
@@ -701,7 +744,7 @@ async fn event_handler(
                 let skyblock_join_time = state.skyblock_join_time.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(LOBBY_COMMAND_DELAY_SECS)).await;
-                    bot_clone.write_chat_packet("/play skyblock");
+                    bot_clone.write_chat_packet("/play sb");
                 });
                 
                 // Set the join time for timeout tracking
@@ -792,16 +835,19 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            // === Startup Workflow ===
+                            // === Startup Workflow (matches TypeScript runStartupWorkflow in BAF.ts) ===
                             *bot_state.write() = BotState::Startup;
                             info!("╔══════════════════════════════════════╗");
                             info!("║        BAF Startup Workflow          ║");
                             info!("╚══════════════════════════════════════╝");
-                            info!("[Startup] Step 1: Checking cookie... (skipped)");
-                            info!("[Startup] Step 2: Managing bazaar orders... (skipped)");
-                            
-                            // Step 3: Claim sold items
-                            info!("[Startup] Step 3: Claiming sold items...");
+
+                            // Step 1/4: Cookie check handled by main.rs after StartupComplete
+                            info!("[Startup] Step 1/4: Cookie check will run after startup");
+                            // Step 2/4: Bazaar order management handled periodically
+                            info!("[Startup] Step 2/4: Bazaar order management enabled (periodic)");
+
+                            // Step 3/4: Claim sold items
+                            info!("[Startup] Step 3/4: Claiming sold items...");
                             bot_clone.write_chat_packet("/ah");
                             *bot_state.write() = BotState::ClaimingSold;
 
@@ -817,9 +863,9 @@ async fn event_handler(
                             // Ensure we're in Idle for step 4
                             *bot_state.write() = BotState::Idle;
 
-                            // Step 4: Emit StartupComplete — main.rs will request bazaar flips
+                            // Step 4/4: Emit StartupComplete — main.rs will request bazaar flips
                             // and send the startup webhook from there.
-                            info!("[Startup] Startup complete - bot is ready to flip!");
+                            info!("[Startup] Step 4/4: Startup complete - bot is ready to flip!");
                             let _ = event_tx_startup.send(BotEvent::StartupComplete);
                         });
                     }
@@ -868,9 +914,10 @@ async fn event_handler(
                 }
 
                 ClientboundGamePacket::OpenSignEditor(pkt) => {
-                    // Hypixel sends this when the bot clicks "Custom Amount" or "Custom Price"
-                    // in the bazaar GUI. We respond immediately with ServerboundSignUpdate to
-                    // write the desired value (matching TypeScript's bot._client.once('open_sign_entity'))
+                    // Hypixel sends this when the bot clicks "Custom Amount", "Custom Price"
+                    // (bazaar), slot 31 (auction price), or slot 16 in "Auction Duration".
+                    // We respond immediately with ServerboundSignUpdate to write the value
+                    // (matching TypeScript's bot._client.once('open_sign_entity')).
                     let bot_state = *state.bot_state.read();
                     if bot_state == BotState::Bazaar {
                         let step = *state.bazaar_step.read();
@@ -894,6 +941,42 @@ async fn event_handler(
                             }
                         };
 
+                        let packet = ServerboundSignUpdate {
+                            pos,
+                            is_front_text: is_front,
+                            lines: [
+                                text_to_write,
+                                String::new(),
+                                String::new(),
+                                String::new(),
+                            ],
+                        };
+                        bot.write_packet(packet);
+                    } else if bot_state == BotState::Selling {
+                        // Auction sign handler — matches TypeScript's setAuctionDuration and
+                        // bot._client.once('open_sign_entity') for price in sellHandler.ts
+                        let step = *state.auction_step.read();
+                        let pos = pkt.pos;
+                        let is_front = pkt.is_front_text;
+
+                        let (text_to_write, next_step) = match step {
+                            AuctionStep::PriceSign => {
+                                let price = *state.auction_starting_bid.read();
+                                info!("[Auction] Sign opened for price — writing: {}", price);
+                                (price.to_string(), AuctionStep::SetDuration)
+                            }
+                            AuctionStep::DurationSign => {
+                                let hours = *state.auction_duration_hours.read();
+                                info!("[Auction] Sign opened for duration — writing: {} hours", hours);
+                                (hours.to_string(), AuctionStep::ConfirmSell)
+                            }
+                            _ => {
+                                warn!("[Auction] Unexpected sign opened at step {:?}", step);
+                                return Ok(());
+                            }
+                        };
+
+                        *state.auction_step.write() = next_step;
                         let packet = ServerboundSignUpdate {
                             pos,
                             is_front_text: is_front,
@@ -1109,12 +1192,18 @@ async fn execute_command(
             // TODO: Implement trade window handling
             warn!("AcceptTrade implementation incomplete - needs trade window handling");
         }
-        CommandType::SellToAuction { item_name, starting_bid, duration_hours } => {
+        CommandType::SellToAuction { item_name, starting_bid, duration_hours, item_slot, item_id } => {
             info!("Creating auction: {} at {} coins for {} hours", item_name, starting_bid, duration_hours);
-            // TypeScript: opens /ah and creates auction
+            // Store context for window/sign handlers (matches TypeScript sellHandler.ts)
+            *state.auction_item_name.write() = item_name.clone();
+            *state.auction_starting_bid.write() = *starting_bid;
+            *state.auction_duration_hours.write() = *duration_hours;
+            *state.auction_item_slot.write() = *item_slot;
+            *state.auction_item_id.write() = item_id.clone();
+            *state.auction_step.write() = AuctionStep::Initial;
+            // Open auction house — window handler takes over from here
             bot.write_chat_packet("/ah");
-            // TODO: Implement auction creation flow
-            warn!("SellToAuction implementation incomplete - needs auction house window handling");
+            *state.bot_state.write() = BotState::Selling;
         }
         CommandType::UploadInventory => {
             info!("Uploading inventory to COFL");
@@ -1495,6 +1584,149 @@ async fn handle_window_interaction(
                 // Stay in ClaimingSold — after claiming, Hypixel re-opens Manage Auctions
                 // so the next OpenScreen event will handle more items.
                 // The startup-deadline or a new /ah command will eventually push us to Idle.
+            }
+        }
+        BotState::Selling => {
+            // Full auction creation flow matching TypeScript sellHandler.ts
+            // Exact slot numbers from TypeScript: slot 15 (AH nav), slot 48 (BIN type),
+            // slot 31 (price setter), slot 33 (duration), slot 29 (confirm), slot 11 (final confirm)
+
+            // Wait for ContainerSetContent to populate slots
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+            let step = *state.auction_step.read();
+            let item_name = state.auction_item_name.read().clone();
+            let item_slot_opt = *state.auction_item_slot.read();
+            let menu = bot.menu();
+            let slots = menu.slots();
+
+            info!("[Auction] Window: \"{}\" | step: {:?}", window_title, step);
+
+            match step {
+                AuctionStep::Initial => {
+                    // "Auction House" opened — click slot 15 (nav to Manage Auctions)
+                    if window_title.contains("Auction House") {
+                        info!("[Auction] AH opened, clicking slot 15 (Manage Auctions nav)");
+                        *state.auction_step.write() = AuctionStep::OpenManage;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        click_window_slot(bot, window_id, 15).await;
+                    }
+                }
+                AuctionStep::OpenManage => {
+                    // "Manage Auctions" opened — find "Create Auction" button by name
+                    if window_title.contains("Manage Auctions") {
+                        if let Some(i) = find_slot_by_name(&slots, "Create Auction") {
+                            // Check if auction limit reached (TypeScript: check lore for "maximum number")
+                            let lore = get_item_lore_from_slot(&slots[i]);
+                            let lore_text = lore.join(" ").to_lowercase();
+                            if lore_text.contains("maximum") || lore_text.contains("limit") {
+                                warn!("[Auction] Maximum auction count reached, going idle");
+                                *state.bot_state.write() = BotState::Idle;
+                                return;
+                            }
+                            info!("[Auction] Clicking Create Auction at slot {}", i);
+                            *state.auction_step.write() = AuctionStep::ClickCreate;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            click_window_slot(bot, window_id, i as i16).await;
+                        } else {
+                            warn!("[Auction] Create Auction not found in Manage Auctions, going idle");
+                            *state.bot_state.write() = BotState::Idle;
+                        }
+                    }
+                }
+                AuctionStep::ClickCreate => {
+                    // "Create Auction" opened — click slot 48 (BIN auction type)
+                    if window_title.contains("Create Auction") && !window_title.contains("BIN") {
+                        info!("[Auction] Create Auction window opened, clicking slot 48 (BIN)");
+                        *state.auction_step.write() = AuctionStep::SelectBIN;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        click_window_slot(bot, window_id, 48).await;
+                    }
+                }
+                AuctionStep::SelectBIN => {
+                    // "Create BIN Auction" opened first time (setPrice=false in TS)
+                    // Find item by slot or by name, click it, then click slot 31 for price sign
+                    if window_title.contains("Create BIN Auction") {
+                        // Calculate inventory slot: mineflayer_slot - 9 + window_player_start
+                        let player_start = *menu.player_slots_range().start();
+                        let target_slot = if let Some(mj_slot) = item_slot_opt {
+                            // TypeScript: itemSlot = data.slot - bot.inventory.inventoryStart + sellWindow.inventoryStart
+                            // mineflayer inventoryStart = 9; slots 9-44 are player inventory (36 slots)
+                            if mj_slot >= 9 && mj_slot <= 44 {
+                                let offset = (mj_slot as usize) - 9;
+                                let ws = player_start + offset;
+                                if ws < slots.len() && !slots[ws].is_empty() {
+                                    info!("[Auction] Using computed slot {} for item (mj_slot={})", ws, mj_slot);
+                                    Some(ws)
+                                } else {
+                                    info!("[Auction] Computed slot {} empty/invalid, falling back to name search", ws);
+                                    find_slot_by_name(&slots, &item_name)
+                                }
+                            } else {
+                                info!("[Auction] mj_slot {} out of expected range 9-44, falling back to name search", mj_slot);
+                                find_slot_by_name(&slots, &item_name)
+                            }
+                        } else {
+                            find_slot_by_name(&slots, &item_name)
+                        };
+
+                        if let Some(i) = target_slot {
+                            info!("[Auction] Clicking item at slot {}", i);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            click_window_slot(bot, window_id, i as i16).await;
+                            // Click slot 31 (price setter) — sign will open, handled in OpenSignEditor
+                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                            info!("[Auction] Clicking slot 31 (price setter)");
+                            *state.auction_step.write() = AuctionStep::PriceSign;
+                            click_window_slot(bot, window_id, 31).await;
+                        } else {
+                            warn!("[Auction] Item \"{}\" not found in Create BIN Auction window, going idle", item_name);
+                            *state.bot_state.write() = BotState::Idle;
+                        }
+                    }
+                }
+                AuctionStep::SetDuration => {
+                    // "Create BIN Auction" opened second time (setPrice=true, durationSet=false in TS)
+                    // Click slot 33 to open "Auction Duration" window
+                    if window_title.contains("Create BIN Auction") {
+                        info!("[Auction] Price set, clicking slot 33 (duration)");
+                        *state.auction_step.write() = AuctionStep::DurationSign;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        click_window_slot(bot, window_id, 33).await;
+                    }
+                }
+                AuctionStep::DurationSign => {
+                    // "Auction Duration" window opened — click slot 16 to open sign for duration
+                    if window_title.contains("Auction Duration") {
+                        info!("[Auction] Auction Duration window opened, clicking slot 16 (sign trigger)");
+                        // Sign handler (OpenSignEditor) will fire and advance step to ConfirmSell
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        click_window_slot(bot, window_id, 16).await;
+                    }
+                }
+                AuctionStep::ConfirmSell => {
+                    // "Create BIN Auction" opened third time (setPrice=true, durationSet=true in TS)
+                    // Click slot 29 to proceed to "Confirm BIN Auction"
+                    if window_title.contains("Create BIN Auction") {
+                        info!("[Auction] Both price and duration set, clicking slot 29 (confirm item)");
+                        *state.auction_step.write() = AuctionStep::FinalConfirm;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        click_window_slot(bot, window_id, 29).await;
+                    }
+                }
+                AuctionStep::FinalConfirm => {
+                    // "Confirm BIN Auction" window — click slot 11 to finalize
+                    if window_title.contains("Confirm BIN Auction") || window_title.contains("Confirm") {
+                        info!("[Auction] Confirm BIN Auction window, clicking slot 11 (final confirm)");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        click_window_slot(bot, window_id, 11).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        info!("[Auction] ===== AUCTION CREATED =====");
+                        *state.bot_state.write() = BotState::Idle;
+                    }
+                }
+                // PriceSign step: no window interaction needed; sign handler does the work
+                AuctionStep::PriceSign => {}
             }
         }
         _ => {

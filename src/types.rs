@@ -124,6 +124,10 @@ pub enum CommandType {
         item_name: String,
         starting_bid: u64,
         duration_hours: u64,
+        /// Mineflayer inventory slot (9-44) from COFL createAuction message
+        item_slot: Option<u64>,
+        /// ExtraAttributes.id from COFL for item identity verification
+        item_id: Option<String>,
     },
     // Advanced commands matching TypeScript BAF.ts
     ClickSlot {

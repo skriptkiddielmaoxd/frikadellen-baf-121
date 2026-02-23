@@ -49,6 +49,12 @@ impl ConfigLoader {
         let config: Config = toml::from_str(&contents)
             .context("Failed to parse config file")?;
         
+        // Merge any missing fields from defaults into the loaded config
+        // (matches TypeScript initConfigHelper: "add new default values to existing config
+        //  if new property was added in newer version").
+        // Currently there are no programmatic merges to perform here —
+        // main.rs prompts the user for any missing interactive fields (e.g. webhook_url).
+        
         info!("Loaded configuration from {:?}", self.config_path);
         Ok(config)
     }
