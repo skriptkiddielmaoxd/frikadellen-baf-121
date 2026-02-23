@@ -79,6 +79,8 @@ pub struct BotClient {
     sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
+    /// Whether to use the confirm-skip technique when purchasing BIN auctions
+    pub confirm_skip: bool,
 }
 
 /// Events that can be emitted by the bot
@@ -131,6 +133,7 @@ impl BotClient {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
+            confirm_skip: false,
         }
     }
 
@@ -201,6 +204,7 @@ impl BotClient {
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
+            confirm_skip: self.confirm_skip,
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -508,6 +512,8 @@ pub struct BotClientState {
     pub sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
+    /// Whether to use the confirm-skip technique when purchasing BIN auctions
+    pub confirm_skip: bool,
 }
 
 impl Default for BotClientState {
@@ -541,6 +547,7 @@ impl Default for BotClientState {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
+            confirm_skip: false,
         }
     }
 }
@@ -1328,14 +1335,21 @@ async fn handle_window_interaction(
     
     match bot_state {
         BotState::Purchasing => {
-            // Confirm-skip technique: send slot 31 twice on the same BIN Auction View window.
-            // The second packet acts as the confirmation, skipping the "Confirm Purchase" dialog
-            // entirely.  This matches how other Hypixel macros implement confirm-skip and avoids
-            // the race condition where the Confirm Purchase window opens on a stale window ID.
             if window_title.contains("BIN Auction View") {
-                click_window_slot(bot, window_id, 31).await;
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                click_window_slot(bot, window_id, 31).await;
+                if state.confirm_skip {
+                    // Confirm-skip: send slot 31 twice (~one tick apart).
+                    // The second packet skips the Confirm Purchase dialog entirely.
+                    click_window_slot(bot, window_id, 31).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    click_window_slot(bot, window_id, 31).await;
+                    *state.bot_state.write() = BotState::Idle;
+                } else {
+                    // Normal flow: click Buy and wait for the Confirm Purchase window.
+                    click_window_slot(bot, window_id, 31).await;
+                }
+            } else if window_title.contains("Confirm Purchase") {
+                // Only reached when confirm_skip is disabled.
+                click_window_slot(bot, window_id, 11).await;
                 *state.bot_state.write() = BotState::Idle;
             }
         }
