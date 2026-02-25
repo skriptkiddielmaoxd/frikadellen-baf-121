@@ -2432,51 +2432,6 @@ fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
     None
 }
 
-/// Convert a simdnbt-serialised JSON value to prismarine-nbt format.
-///
-/// Prismarine-nbt wraps every value as `{"type": N, "value": V}`.
-/// COFL (written for mineflayer 1.8.9) expects this format when parsing
-/// `ExtraAttributes.id` for SkyBlock item identification.
-fn to_prismarine_nbt(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut prismarine_map = serde_json::Map::new();
-            for (key, val) in map {
-                prismarine_map.insert(key.clone(), to_prismarine_nbt(val));
-            }
-            serde_json::json!({"type": 10, "value": serde_json::Value::Object(prismarine_map)})
-        }
-        serde_json::Value::String(s) => serde_json::json!({"type": 8, "value": s}),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_json::json!({"type": 3, "value": i})
-            } else {
-                serde_json::json!({"type": 6, "value": n})
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            if arr.is_empty() {
-                return serde_json::json!({"type": 9, "value": {"type": 0, "value": []}});
-            }
-            let list_type = match &arr[0] {
-                serde_json::Value::String(_) => 8,
-                serde_json::Value::Object(_) => 10,
-                serde_json::Value::Array(_) => 9,
-                serde_json::Value::Number(_) => 3,
-                _ => 8,
-            };
-            let values: Vec<serde_json::Value> = if list_type == 10 {
-                arr.iter().map(to_prismarine_nbt).collect()
-            } else {
-                arr.to_vec()
-            };
-            serde_json::json!({"type": 9, "value": {"type": list_type, "value": values}})
-        }
-        serde_json::Value::Bool(b) => serde_json::json!({"type": 1, "value": if *b { 1i32 } else { 0i32 }}),
-        _ => serde_json::json!({"type": 8, "value": value.to_string()}),
-    }
-}
-
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
 ///
 /// Called after every ContainerSetContent / ContainerSetSlot so that
@@ -2500,34 +2455,21 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             let item_type = item.kind() as u32;
             let nbt_data = if let Some(item_data) = item.as_present() {
                 match serde_json::to_value(item_data) {
-                    Ok(value) => {
-                        // Extract minecraft:custom_data from components and convert
-                        // to prismarine-nbt format so COFL can parse ExtraAttributes.
-                        let custom_data = value
-                            .as_object()
-                            .and_then(|obj| obj.get("components"))
-                            .and_then(|comp| comp.as_object())
-                            .and_then(|comp| comp.get("minecraft:custom_data"));
-                        if let Some(cd) = custom_data {
-                            to_prismarine_nbt(cd)
-                        } else {
-                            serde_json::Value::Null
-                        }
-                    }
+                    Ok(value) => value
+                        .as_object()
+                        .and_then(|obj| obj.get("components").cloned())
+                        .unwrap_or(serde_json::Value::Null),
                     Err(_) => serde_json::Value::Null,
                 }
             } else {
                 serde_json::Value::Null
             };
-            // Strip "minecraft:" namespace prefix to match mineflayer item names
-            let item_name = item.kind().to_string();
-            let item_name = item_name.strip_prefix("minecraft:").unwrap_or(&item_name);
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
                 "metadata": 0,
                 "nbt": nbt_data,
-                "name": item_name,
+                "name": item.kind().to_string(),
                 "slot": mineflayer_slot
             });
         }
