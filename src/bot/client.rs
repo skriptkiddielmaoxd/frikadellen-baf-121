@@ -1836,17 +1836,10 @@ async fn handle_window_interaction(
         }
         BotState::ClaimingPurchased => {
             if window_title.contains("Auction House") {
-                // Wait for ContainerSetContent to populate slots, then find "Your Bids" by name
+                // Hardcoded slot 13 for "Your Bids" navigation — matches TypeScript clickWindow(bot, 13)
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                let menu = bot.menu();
-                let slots = menu.slots();
-                if let Some(i) = find_slot_by_name(&slots, "Your Bids") {
-                    info!("[ClaimPurchased] Auction House opened - clicking Your Bids (slot {})", i);
-                    click_window_slot(bot, window_id, i as i16).await;
-                } else {
-                    info!("[ClaimPurchased] Your Bids not found, going idle");
-                    *state.bot_state.write() = BotState::Idle;
-                }
+                info!("[ClaimPurchased] Auction House opened - clicking slot 13 (Your Bids)");
+                click_window_slot(bot, window_id, 13).await;
             } else if window_title.contains("Your Bids") {
                 info!("[ClaimPurchased] Your Bids opened - looking for Claim All or Sold item");
                 // Wait for ContainerSetContent to arrive and populate slots
@@ -2473,8 +2466,8 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             } else {
                 serde_json::Value::Null
             };
-            let item_kind = item.kind().to_string();
-            let item_name = item_kind.strip_prefix("minecraft:").unwrap_or(&item_kind);
+            let item_name = get_item_display_name_from_slot(item)
+                .unwrap_or_else(|| item.kind().to_string());
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
