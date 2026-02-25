@@ -990,9 +990,10 @@ async fn event_handler(
                     });
                 }
             } else if clean_message.contains("This BIN sale is still in its grace period!") {
-                // Hypixel rejected the buy click because the BIN is in its grace period.
-                // Spam-click slot 31 every 100 ms until the purchase goes through or the
-                // window closes — identical to AutoBuy.initBedSpam() in TypeScript.
+                // Hypixel rejected the buy click because the BIN is in its grace period,
+                // but slot 31 already shows gold_nugget (not a bed).  Keep clicking every
+                // 100 ms until the Confirm Purchase window opens — matches
+                // AutoBuy.initBedSpam() which clicks whenever slotName === "gold_nugget".
                 if *state.bot_state.read() == BotState::Purchasing {
                     let already_active = state.grace_period_spam_active.swap(true, Ordering::Relaxed);
                     if !already_active {
@@ -1571,16 +1572,26 @@ async fn handle_window_interaction(
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
-                    // Click slot 31 every 100ms during bed phase (to catch the moment grace
-                    // period ends and gold_nugget appears).  Beds are NOT counted as failures —
-                    // only truly unexpected slot states trigger the failure counter.
-                    // Matches AutoBuy.initBedSpam() intent: keep trying until grace period ends.
-                    info!("[AH] Bed detected in slot 31 — starting bed spam ({} ms interval)", 100);
+                    // Poll slot 31 every 100 ms and click ONLY when gold_nugget appears
+                    // (grace period ended).  Do NOT click during the bed phase —
+                    // matches AutoBuy.initBedSpam() which only calls betterClick(31) when
+                    // slotName === "gold_nugget" and counts every non-gold_nugget iteration
+                    // as a failure.  We give the grace period up to 60 s to expire before
+                    // giving up (longer than TypeScript's 5-tick limit because we don't have
+                    // the "re-queue" mechanism).
+                    info!("[AH] Bed detected in slot 31 — waiting for grace period to end (polling every 100 ms)");
                     const CLICK_INTERVAL_MS: u64 = 100;
                     const MAX_FAILED_CLICKS: usize = 5;
+                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
                     let mut failed_clicks: usize = 0;
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
+
+                        if tokio::time::Instant::now() >= bed_deadline {
+                            warn!("[AH] Bed timing: grace period did not end within 60 s — giving up");
+                            *state.bot_state.write() = BotState::Idle;
+                            return;
+                        }
 
                         let current_kind = {
                             let menu = bot.menu();
@@ -1592,28 +1603,26 @@ async fn handle_window_interaction(
                         };
 
                         if current_kind == "air" || current_kind.contains("air") {
-                            // Window closed — stop spam
-                            info!("[AH] Stopped bed spam — window closed");
+                            // Window closed — stop
+                            info!("[AH] Bed timing: window closed");
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
                             // Grace period ended — buy now
-                            info!("[AH] Bed spam: gold_nugget appeared, buying (slot 31)");
+                            info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
                             click_window_slot(bot, window_id, 31).await;
                             click_window_slot(bot, window_id, 31).await;
                             // Stay in Purchasing so Confirm Purchase handler fires
                             break;
                         } else if current_kind.contains("bed") {
-                            // Still in grace period — click to attempt purchase and stay in loop
-                            debug!("[AH] Bed spam: grace period active, clicking slot 31");
-                            click_window_slot(bot, window_id, 31).await;
-                            // Do NOT increment failed_clicks for beds; grace period is expected
+                            // Still in grace period — wait, do NOT click
+                            debug!("[AH] Bed timing: grace period still active, waiting…");
                         } else {
                             // Unexpected slot state
                             failed_clicks += 1;
-                            debug!("[AH] Bed spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
+                            debug!("[AH] Bed timing: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
                             if failed_clicks >= MAX_FAILED_CLICKS {
-                                warn!("[AH] Stopped bed spam after {} failed clicks", failed_clicks);
+                                warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
