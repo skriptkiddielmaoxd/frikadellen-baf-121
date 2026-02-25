@@ -85,6 +85,9 @@ pub struct BotClient {
     pub confirm_skip: bool,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
+    /// Set when "You reached your maximum of XY Bazaar orders!" is received.
+    /// Cleared when an order fills (Claimed message detected).
+    bazaar_at_limit: Arc<AtomicBool>,
     /// Cached player-inventory JSON (serialised Window object).
     /// Updated on every ContainerSetContent / ContainerSetSlot for the player
     /// inventory window (id 0) so that getInventory can be answered instantly,
@@ -157,6 +160,7 @@ impl BotClient {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             confirm_skip: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
+            bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
         }
@@ -231,6 +235,7 @@ impl BotClient {
             scoreboard_teams: self.scoreboard_teams.clone(),
             confirm_skip: self.confirm_skip,
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
+            bazaar_at_limit: self.bazaar_at_limit.clone(),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
@@ -403,6 +408,11 @@ impl BotClient {
     /// handler which calls `JSON.stringify(bot.inventory)` directly.
     pub fn get_cached_inventory_json(&self) -> Option<String> {
         self.cached_inventory_json.read().clone()
+    }
+
+    /// Returns true if the bazaar order limit has been hit and not yet cleared.
+    pub fn is_bazaar_at_limit(&self) -> bool {
+        self.bazaar_at_limit.load(Ordering::Relaxed)
     }
 
     /// Documentation for sending chat messages
@@ -599,6 +609,9 @@ pub struct BotClientState {
     pub confirm_skip: bool,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
+    /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
+    /// Cleared when an order fills. Prevents placing new orders while at the cap.
+    pub bazaar_at_limit: Arc<AtomicBool>,
     /// Time when BIN Auction View opened — start of buy-speed measurement
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
@@ -649,6 +662,7 @@ impl Default for BotClientState {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             confirm_skip: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
+            bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
@@ -770,6 +784,28 @@ fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
 }
 
 /// Find the first slot index matching the given name (case-insensitive)
+/// Format a f64 price with comma-separated thousands for sign input.
+/// e.g. 60000000.2 → "60,000,000.2", 8.0 → "8.0", 1234567.89 → "1,234,567.9"
+fn format_price_for_sign(price: f64) -> String {
+    let rounded = (price * 10.0).round() / 10.0;
+    let int_part = rounded.floor() as i64;
+    let frac = (rounded - int_part as f64).abs();
+    let int_str = int_part.to_string();
+    // Insert commas every 3 digits from the right
+    let digits: Vec<char> = int_str.chars().collect();
+    let mut with_commas = String::new();
+    let len = digits.len();
+    for (i, &c) in digits.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            with_commas.push(',');
+        }
+        with_commas.push(c);
+    }
+    // Always show one decimal place
+    let frac_digit = (frac * 10.0).round() as u32;
+    format!("{}.{}", with_commas, frac_digit)
+}
+
 fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Option<usize> {
     let name_lower = name.to_lowercase();
     for (i, item) in slots.iter().enumerate() {
@@ -954,9 +990,10 @@ async fn event_handler(
                     });
                 }
             } else if clean_message.contains("This BIN sale is still in its grace period!") {
-                // Hypixel rejected the buy click because the BIN is in its grace period.
-                // Spam-click slot 31 every 100 ms until the purchase goes through or the
-                // window closes — identical to AutoBuy.initBedSpam() in TypeScript.
+                // Hypixel rejected the buy click because the BIN is in its grace period,
+                // but slot 31 already shows gold_nugget (not a bed).  Keep clicking every
+                // 100 ms until the Confirm Purchase window opens — matches
+                // AutoBuy.initBedSpam() which clicks whenever slotName === "gold_nugget".
                 if *state.bot_state.read() == BotState::Purchasing {
                     let already_active = state.grace_period_spam_active.swap(true, Ordering::Relaxed);
                     if !already_active {
@@ -1003,7 +1040,20 @@ async fn event_handler(
                     }
                 }
             }
-            
+
+            // Detect bazaar order limit ("You reached your maximum of XY Bazaar orders!")
+            // and clear it when an order fills ("Claimed ... coins from ...").
+            if clean_message.contains("You reached your maximum of") && clean_message.contains("Bazaar orders") {
+                warn!("[Bazaar] Order limit reached — pausing bazaar flips until a slot frees up");
+                state.bazaar_at_limit.store(true, Ordering::Relaxed);
+            } else if clean_message.contains("[Bazaar]") && (clean_message.contains("coins from selling") || clean_message.contains("coins from buying")) {
+                // An order filled — a slot is now free
+                if state.bazaar_at_limit.load(Ordering::Relaxed) {
+                    info!("[Bazaar] Order filled, clearing order-limit flag");
+                    state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                }
+            }
+
             // Check if we've teleported to island yet
             let teleported = *state.teleported_to_island.read();
             let join_time = *state.skyblock_join_time.read();
@@ -1153,9 +1203,7 @@ async fn event_handler(
                             }
                             BazaarStep::SetPrice => {
                                 let price = *state.bazaar_price_per_unit.read();
-                                // Round to 1 decimal place: "8.2" stays "8.2", "8.3894384" → "8.4"
-                                // Matches user requirement; avoids f64 toString giving "8" for 8.0.
-                                let s = format!("{:.1}", price);
+                                let s = format_price_for_sign(price);
                                 info!("[Bazaar] Sign opened for price — writing: {}", s);
                                 s
                             }
@@ -1165,7 +1213,7 @@ async fn event_handler(
                                 // Treat this as the price sign (matching TypeScript behaviour where
                                 // sell offers go straight to the price sign).
                                 let price = *state.bazaar_price_per_unit.read();
-                                let s = format!("{:.1}", price);
+                                let s = format_price_for_sign(price);
                                 info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", s);
                                 *state.bazaar_step.write() = BazaarStep::SetPrice;
                                 s
@@ -1524,16 +1572,26 @@ async fn handle_window_interaction(
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
-                    // Click slot 31 every 100ms during bed phase (to catch the moment grace
-                    // period ends and gold_nugget appears).  Beds are NOT counted as failures —
-                    // only truly unexpected slot states trigger the failure counter.
-                    // Matches AutoBuy.initBedSpam() intent: keep trying until grace period ends.
-                    info!("[AH] Bed detected in slot 31 — starting bed spam ({} ms interval)", 100);
+                    // Poll slot 31 every 100 ms and click ONLY when gold_nugget appears
+                    // (grace period ended).  Do NOT click during the bed phase —
+                    // matches AutoBuy.initBedSpam() which only calls betterClick(31) when
+                    // slotName === "gold_nugget" and counts every non-gold_nugget iteration
+                    // as a failure.  We give the grace period up to 60 s to expire before
+                    // giving up (longer than TypeScript's 5-tick limit because we don't have
+                    // the "re-queue" mechanism).
+                    info!("[AH] Bed detected in slot 31 — waiting for grace period to end (polling every 100 ms)");
                     const CLICK_INTERVAL_MS: u64 = 100;
                     const MAX_FAILED_CLICKS: usize = 5;
+                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
                     let mut failed_clicks: usize = 0;
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
+
+                        if tokio::time::Instant::now() >= bed_deadline {
+                            warn!("[AH] Bed timing: grace period did not end within 60 s — giving up");
+                            *state.bot_state.write() = BotState::Idle;
+                            return;
+                        }
 
                         let current_kind = {
                             let menu = bot.menu();
@@ -1545,28 +1603,26 @@ async fn handle_window_interaction(
                         };
 
                         if current_kind == "air" || current_kind.contains("air") {
-                            // Window closed — stop spam
-                            info!("[AH] Stopped bed spam — window closed");
+                            // Window closed — stop
+                            info!("[AH] Bed timing: window closed");
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
                             // Grace period ended — buy now
-                            info!("[AH] Bed spam: gold_nugget appeared, buying (slot 31)");
+                            info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
                             click_window_slot(bot, window_id, 31).await;
                             click_window_slot(bot, window_id, 31).await;
                             // Stay in Purchasing so Confirm Purchase handler fires
                             break;
                         } else if current_kind.contains("bed") {
-                            // Still in grace period — click to attempt purchase and stay in loop
-                            debug!("[AH] Bed spam: grace period active, clicking slot 31");
-                            click_window_slot(bot, window_id, 31).await;
-                            // Do NOT increment failed_clicks for beds; grace period is expected
+                            // Still in grace period — wait, do NOT click
+                            debug!("[AH] Bed timing: grace period still active, waiting…");
                         } else {
                             // Unexpected slot state
                             failed_clicks += 1;
-                            debug!("[AH] Bed spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
+                            debug!("[AH] Bed timing: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
                             if failed_clicks >= MAX_FAILED_CLICKS {
-                                warn!("[AH] Stopped bed spam after {} failed clicks", failed_clicks);
+                                warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
@@ -1758,27 +1814,39 @@ async fn handle_window_interaction(
                 *state.bazaar_step.write() = BazaarStep::Confirm;
                 click_window_slot(bot, window_id, 13).await;
 
-                // Order placement complete — emit event and go idle after short wait
+                // Wait briefly for the server to respond (limit message arrives asynchronously)
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                let item = item_name.clone();
-                let amount = *state.bazaar_amount.read();
-                let price_per_unit = *state.bazaar_price_per_unit.read();
-                let _ = state.event_tx.send(BotEvent::BazaarOrderPlaced {
-                    item_name: item,
-                    amount,
-                    price_per_unit,
-                    is_buy_order,
-                });
-                info!("[Bazaar] ===== ORDER COMPLETE =====");
+
+                if state.bazaar_at_limit.load(Ordering::Relaxed) {
+                    warn!("[Bazaar] Order rejected (at limit) — not emitting BazaarOrderPlaced");
+                } else {
+                    let item = item_name.clone();
+                    let amount = *state.bazaar_amount.read();
+                    let price_per_unit = *state.bazaar_price_per_unit.read();
+                    let _ = state.event_tx.send(BotEvent::BazaarOrderPlaced {
+                        item_name: item,
+                        amount,
+                        price_per_unit,
+                        is_buy_order,
+                    });
+                    info!("[Bazaar] ===== ORDER COMPLETE =====");
+                }
                 *state.bot_state.write() = BotState::Idle;
             }
         }
         BotState::ClaimingPurchased => {
             if window_title.contains("Auction House") {
-                info!("[ClaimPurchased] Auction House opened - clicking Your Bids (slot 13)");
-                // Small delay to let ContainerSetContent populate slots
+                // Wait for ContainerSetContent to populate slots, then find "Your Bids" by name
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                click_window_slot(bot, window_id, 13).await;
+                let menu = bot.menu();
+                let slots = menu.slots();
+                if let Some(i) = find_slot_by_name(&slots, "Your Bids") {
+                    info!("[ClaimPurchased] Auction House opened - clicking Your Bids (slot {})", i);
+                    click_window_slot(bot, window_id, i as i16).await;
+                } else {
+                    info!("[ClaimPurchased] Your Bids not found, going idle");
+                    *state.bot_state.write() = BotState::Idle;
+                }
             } else if window_title.contains("Your Bids") {
                 info!("[ClaimPurchased] Your Bids opened - looking for Claim All or Sold item");
                 // Wait for ContainerSetContent to arrive and populate slots
@@ -1873,9 +1941,16 @@ async fn handle_window_interaction(
                     info!("[ClaimSold] Clicking slot 31");
                     click_window_slot(bot, window_id, 31).await;
                 }
-                // Stay in ClaimingSold — after claiming, Hypixel re-opens Manage Auctions
-                // so the next OpenScreen event will handle more items.
-                // The startup-deadline or a new /ah command will eventually push us to Idle.
+                // Spawn a short watchdog: if Hypixel doesn't re-open Manage Auctions within
+                // 1.5 s, transition to Idle so the command queue can proceed.
+                let claim_state_ref = state.bot_state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                    if *claim_state_ref.read() == BotState::ClaimingSold {
+                        info!("[ClaimSold] No follow-up window after 1.5s, going idle");
+                        *claim_state_ref.write() = BotState::Idle;
+                    }
+                });
             }
         }
         BotState::Selling => {
@@ -2101,12 +2176,12 @@ async fn handle_window_interaction(
             // Step 2/4 of startup: cancel all existing bazaar orders.
             // Mirrors TypeScript bazaarOrderManager.ts manageStartupOrders().
             // Flow: Bazaar window → click slot 50 (Manage Orders) → iterate orders → cancel each.
-            if window_title.contains("Bazaar") && !window_title.contains("Manage Orders") {
+            if window_title.contains("Bazaar") && !window_title.contains("Manage Orders") && !window_title.contains("Bazaar Orders") {
                 // Main bazaar page — click "Manage Orders" at slot 50
                 info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot 50)");
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 click_window_slot(bot, window_id, 50).await;
-            } else if window_title.contains("Manage Orders") || window_title.contains("Your Orders") {
+            } else if window_title.contains("Manage Orders") || window_title.contains("Your Orders") || window_title.contains("Bazaar Orders") {
                 // Manage Orders window — cancel all existing orders one by one
                 info!("[ManageOrders] Processing existing orders...");
                 let mut cancelled: u64 = 0;
@@ -2392,18 +2467,20 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                     Ok(value) => value
                         .as_object()
                         .and_then(|obj| obj.get("components").cloned())
-                        .unwrap_or(value),
+                        .unwrap_or(serde_json::Value::Null),
                     Err(_) => serde_json::Value::Null,
                 }
             } else {
                 serde_json::Value::Null
             };
+            let item_kind = item.kind().to_string();
+            let item_name = item_kind.strip_prefix("minecraft:").unwrap_or(&item_kind);
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
                 "metadata": 0,
                 "nbt": nbt_data,
-                "name": item.kind().to_string(),
+                "name": item_name,
                 "slot": mineflayer_slot
             });
         }
