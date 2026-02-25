@@ -2466,7 +2466,8 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             } else {
                 serde_json::Value::Null
             };
-            let item_name = item.kind().to_string();
+            let item_name = get_item_display_name_from_slot(item)
+                .unwrap_or_else(|| item.kind().to_string());
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
