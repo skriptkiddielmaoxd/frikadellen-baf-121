@@ -770,6 +770,28 @@ fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
 }
 
 /// Find the first slot index matching the given name (case-insensitive)
+/// Format a f64 price with comma-separated thousands for sign input.
+/// e.g. 60000000.2 → "60,000,000.2", 8.0 → "8.0", 1234567.89 → "1,234,567.9"
+fn format_price_for_sign(price: f64) -> String {
+    let rounded = (price * 10.0).round() / 10.0;
+    let int_part = rounded.floor() as i64;
+    let frac = (rounded - int_part as f64).abs();
+    let int_str = int_part.to_string();
+    // Insert commas every 3 digits from the right
+    let digits: Vec<char> = int_str.chars().collect();
+    let mut with_commas = String::new();
+    let len = digits.len();
+    for (i, &c) in digits.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            with_commas.push(',');
+        }
+        with_commas.push(c);
+    }
+    // Always show one decimal place
+    let frac_digit = (frac * 10.0).round() as u32;
+    format!("{}.{}", with_commas, frac_digit)
+}
+
 fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Option<usize> {
     let name_lower = name.to_lowercase();
     for (i, item) in slots.iter().enumerate() {
@@ -1153,9 +1175,7 @@ async fn event_handler(
                             }
                             BazaarStep::SetPrice => {
                                 let price = *state.bazaar_price_per_unit.read();
-                                // Round to 1 decimal place: "8.2" stays "8.2", "8.3894384" → "8.4"
-                                // Matches user requirement; avoids f64 toString giving "8" for 8.0.
-                                let s = format!("{:.1}", price);
+                                let s = format_price_for_sign(price);
                                 info!("[Bazaar] Sign opened for price — writing: {}", s);
                                 s
                             }
@@ -1165,7 +1185,7 @@ async fn event_handler(
                                 // Treat this as the price sign (matching TypeScript behaviour where
                                 // sell offers go straight to the price sign).
                                 let price = *state.bazaar_price_per_unit.read();
-                                let s = format!("{:.1}", price);
+                                let s = format_price_for_sign(price);
                                 info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", s);
                                 *state.bazaar_step.write() = BazaarStep::SetPrice;
                                 s
@@ -1775,10 +1795,17 @@ async fn handle_window_interaction(
         }
         BotState::ClaimingPurchased => {
             if window_title.contains("Auction House") {
-                info!("[ClaimPurchased] Auction House opened - clicking Your Bids (slot 13)");
-                // Small delay to let ContainerSetContent populate slots
+                // Wait for ContainerSetContent to populate slots, then find "Your Bids" by name
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                click_window_slot(bot, window_id, 13).await;
+                let menu = bot.menu();
+                let slots = menu.slots();
+                if let Some(i) = find_slot_by_name(&slots, "Your Bids") {
+                    info!("[ClaimPurchased] Auction House opened - clicking Your Bids (slot {})", i);
+                    click_window_slot(bot, window_id, i as i16).await;
+                } else {
+                    info!("[ClaimPurchased] Your Bids not found, going idle");
+                    *state.bot_state.write() = BotState::Idle;
+                }
             } else if window_title.contains("Your Bids") {
                 info!("[ClaimPurchased] Your Bids opened - looking for Claim All or Sold item");
                 // Wait for ContainerSetContent to arrive and populate slots
@@ -2101,12 +2128,12 @@ async fn handle_window_interaction(
             // Step 2/4 of startup: cancel all existing bazaar orders.
             // Mirrors TypeScript bazaarOrderManager.ts manageStartupOrders().
             // Flow: Bazaar window → click slot 50 (Manage Orders) → iterate orders → cancel each.
-            if window_title.contains("Bazaar") && !window_title.contains("Manage Orders") {
+            if window_title.contains("Bazaar") && !window_title.contains("Manage Orders") && !window_title.contains("Bazaar Orders") {
                 // Main bazaar page — click "Manage Orders" at slot 50
                 info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot 50)");
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 click_window_slot(bot, window_id, 50).await;
-            } else if window_title.contains("Manage Orders") || window_title.contains("Your Orders") {
+            } else if window_title.contains("Manage Orders") || window_title.contains("Your Orders") || window_title.contains("Bazaar Orders") {
                 // Manage Orders window — cancel all existing orders one by one
                 info!("[ManageOrders] Processing existing orders...");
                 let mut cancelled: u64 = 0;
