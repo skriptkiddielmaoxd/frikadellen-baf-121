@@ -239,6 +239,7 @@ impl BotClient {
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
+            bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
             cookie_time_secs: Arc::new(RwLock::new(0)),
@@ -619,6 +620,9 @@ pub struct BotClientState {
     /// Set to true while a grace-period spam-click loop is running so a second
     /// chat message does not start a duplicate loop.
     pub grace_period_spam_active: Arc<AtomicBool>,
+    /// Set to true while the bot is waiting for a bed (grace-period) to expire so
+    /// the 5-second GUI watchdog does not incorrectly auto-close the BIN Auction View.
+    pub bed_timing_active: Arc<AtomicBool>,
     /// Cached player-inventory JSON shared with BotClient for instant getInventory replies.
     pub cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value (hours threshold to trigger a cookie buy). 0 = disabled.
@@ -666,6 +670,7 @@ impl Default for BotClientState {
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
+            bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             cookie_time_secs: Arc::new(RwLock::new(0)),
@@ -1134,21 +1139,25 @@ async fn event_handler(
                     // interactive bot state after 5 s it is considered stuck and is
                     // closed automatically.  Matches user requirement "guis should
                     // autoclose if not used for over 5 seconds".
+                    // Exception: bed (grace-period) timing — the BIN Auction View must
+                    // stay open for up to 60 s while waiting for the grace period to end.
                     {
                         let wdog_bot   = bot.clone();
                         let wdog_wid   = window_id as u8;
                         let wdog_state = state.bot_state.clone();
                         let wdog_last  = state.last_window_id.clone();
                         let wdog_spam  = state.grace_period_spam_active.clone();
+                        let wdog_bed   = state.bed_timing_active.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                            let still_open = *wdog_last.read() == wdog_wid;
-                            let cur_state  = *wdog_state.read();
+                            let still_open  = *wdog_last.read() == wdog_wid;
+                            let cur_state   = *wdog_state.read();
+                            let is_bed      = wdog_bed.load(Ordering::Relaxed);
                             let is_interactive = matches!(cur_state,
                                 BotState::Purchasing | BotState::Bazaar | BotState::Selling
                                 | BotState::ClaimingPurchased | BotState::ClaimingSold
                             );
-                            if still_open && is_interactive {
+                            if still_open && is_interactive && !is_bed {
                                 warn!("[GUI] Window {} open for >5 s in state {:?} — auto-closing", wdog_wid, cur_state);
                                 wdog_bot.write_packet(ServerboundContainerClose {
                                     container_id: wdog_wid as i32,
@@ -1164,8 +1173,10 @@ async fn event_handler(
                 }
                 
                 ClientboundGamePacket::ContainerClose(_) => {
-                    // Clear grace-period spam flag so a new BIN Auction View can start fresh.
+                    // Clear grace-period spam and bed-timing flags so a new BIN Auction View
+                    // can start fresh.
                     state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                    state.bed_timing_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
                     if state.event_tx.send(BotEvent::WindowClose).is_err() {
                         debug!("Failed to send WindowClose event - receiver dropped");
@@ -1576,19 +1587,21 @@ async fn handle_window_interaction(
                     // (grace period ended).  Do NOT click during the bed phase —
                     // matches AutoBuy.initBedSpam() which only calls betterClick(31) when
                     // slotName === "gold_nugget" and counts every non-gold_nugget iteration
-                    // as a failure.  We give the grace period up to 60 s to expire before
-                    // giving up (longer than TypeScript's 5-tick limit because we don't have
-                    // the "re-queue" mechanism).
+                    // as a failure.  We give the grace period up to 20 s to expire before
+                    // giving up (Hypixel bed grace periods are at most 20 s).
                     info!("[AH] Bed detected in slot 31 — waiting for grace period to end (polling every 100 ms)");
+                    // Signal the 5-second GUI watchdog to leave this window open.
+                    state.bed_timing_active.store(true, Ordering::Relaxed);
                     const CLICK_INTERVAL_MS: u64 = 100;
                     const MAX_FAILED_CLICKS: usize = 5;
-                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(20);
                     let mut failed_clicks: usize = 0;
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
 
                         if tokio::time::Instant::now() >= bed_deadline {
-                            warn!("[AH] Bed timing: grace period did not end within 60 s — giving up");
+                            warn!("[AH] Bed timing: grace period did not end within 20 s — giving up");
+                            state.bed_timing_active.store(false, Ordering::Relaxed);
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         }
@@ -1605,12 +1618,13 @@ async fn handle_window_interaction(
                         if current_kind == "air" || current_kind.contains("air") {
                             // Window closed — stop
                             info!("[AH] Bed timing: window closed");
+                            state.bed_timing_active.store(false, Ordering::Relaxed);
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
-                            // Grace period ended — buy now
+                            // Grace period ended — buy now (single click only).
                             info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
-                            click_window_slot(bot, window_id, 31).await;
+                            state.bed_timing_active.store(false, Ordering::Relaxed);
                             click_window_slot(bot, window_id, 31).await;
                             // Stay in Purchasing so Confirm Purchase handler fires
                             break;
@@ -1623,23 +1637,40 @@ async fn handle_window_interaction(
                             debug!("[AH] Bed timing: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
                             if failed_clicks >= MAX_FAILED_CLICKS {
                                 warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
+                                state.bed_timing_active.store(false, Ordering::Relaxed);
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
                         }
                     }
                 } else {
-                    // Click slot 31 (buy-now button) twice for reliability (matches TypeScript:
-                    // clickSlot + clickWindow on the same slot).
-                    click_window_slot(bot, window_id, 31).await;
+                    // Click slot 31 once (buy-now button).
+                    // Single click only — double-clicking sends a second packet while Hypixel
+                    // is already preparing the Confirm Purchase window, which confuses the server
+                    // and adds ~300ms of unnecessary latency.
                     click_window_slot(bot, window_id, 31).await;
                 }
             } else if window_title.contains("Confirm Purchase") {
-                // Click slot 11 twice with a short gap for reliability,
-                // matching TypeScript's while-loop retry pattern.
+                // Click slot 11 immediately — speed is everything on a low-latency VPS.
+                // NO pre-delay (matches TypeScript: "NO delay here — speed is everything").
                 click_window_slot(bot, window_id, 11).await;
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                click_window_slot(bot, window_id, 11).await;
+
+                // Wait 100ms. On a VPS near Hypixel this is enough for the
+                // server to process the click and close the window.
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                // Safety retry loop: if the window is still open (click was lost or
+                // the server needs more time), keep retrying every 250ms.
+                // Matches TypeScript's while-loop retry pattern in flipHandler.ts.
+                while state.handlers.current_window_title()
+                    .as_deref()
+                    .map(|t| t.contains("Confirm Purchase"))
+                    .unwrap_or(false)
+                {
+                    click_window_slot(bot, window_id, 11).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                }
+
                 *state.bot_state.write() = BotState::Idle;
             }
         }
