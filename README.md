@@ -1,6 +1,10 @@
 # frikadellen-baf-121
 Frikadellen BAF in the newest minecraft version based on Rust
 
+#if you get banned well you know you risked it its a macro in very early access
+also send me logs of bans thanks
+
+
 ## Features
 
 - **Automated Auction House Flips**: Monitors and executes profitable BIN (Buy It Now) auctions
