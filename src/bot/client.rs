@@ -1628,28 +1628,14 @@ async fn handle_window_interaction(
                             }
                         }
                     }
-                } else if state.confirm_skip {
-                    // Skip mode: click slot 31 twice (primary + redundant packet-loss guard,
-                    // matches TypeScript: clickSlot(bot,31,wid,371) + clickWindow(bot,31)),
-                    // then immediately pre-click slot 11 on the NEXT window ID so the
-                    // Confirm Purchase is accepted before the GUI is even rendered.
-                    // Matches TypeScript: clickSlot(bot, 11, nextWindowID, 159)
-                    click_window_slot(bot, window_id, 31).await;
-                    click_window_slot(bot, window_id, 31).await;
-                    let next_id = if window_id == 100 { 1u8 } else { window_id + 1 };
-                    click_window_slot(bot, next_id, 11).await;
-                    // Keep state = Purchasing so the Confirm Purchase handler below acts
-                    // as a safety retry if the pre-click packet was dropped.
                 } else {
-                    // Normal flow: click slot 31 (hardcoded buy-now button) then wait for
-                    // Confirm Purchase window.  Click twice for reliability (matches TypeScript:
+                    // Click slot 31 (buy-now button) twice for reliability (matches TypeScript:
                     // clickSlot + clickWindow on the same slot).
                     click_window_slot(bot, window_id, 31).await;
                     click_window_slot(bot, window_id, 31).await;
                 }
             } else if window_title.contains("Confirm Purchase") {
-                // Reached in normal flow, and as a safety retry for confirm_skip if the
-                // pre-click packet was dropped.  Click twice with a short gap for reliability,
+                // Click slot 11 twice with a short gap for reliability,
                 // matching TypeScript's while-loop retry pattern.
                 click_window_slot(bot, window_id, 11).await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -2445,6 +2431,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     let player_range = menu.player_slots_range();
 
     let mut slots_array: Vec<serde_json::Value> = vec![serde_json::Value::Null; 46];
+    let mut slot_descriptions: Vec<String> = Vec::new();
 
     for (i, item) in all_slots[player_range].iter().enumerate() {
         let mineflayer_slot = 9 + i;
@@ -2468,6 +2455,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             };
             let item_name = get_item_display_name_from_slot(item)
                 .unwrap_or_else(|| item.kind().to_string());
+            slot_descriptions.push(format!("slot {}: {}x {}", mineflayer_slot, item.count(), item_name));
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
@@ -2478,6 +2466,8 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             });
         }
     }
+
+    debug!("[Inventory] Rebuilt cache: {} non-empty slots — {}", slot_descriptions.len(), slot_descriptions.join(", "));
 
     let inventory_json = serde_json::json!({
         "id": 0,
