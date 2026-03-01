@@ -15,6 +15,12 @@ pub struct Config {
     
     #[serde(default = "default_flip_action_delay")]
     pub flip_action_delay: u64,
+
+    /// Minimum delay between consecutive queued commands in milliseconds.
+    /// Prevents back-to-back Hypixel interactions from overlapping.
+    /// Default: 500ms.
+    #[serde(default = "default_command_delay_ms")]
+    pub command_delay_ms: u64,
     
     #[serde(default = "default_bed_spam_click_delay")]
     pub bed_spam_click_delay: u64,
@@ -129,6 +135,10 @@ fn default_flip_action_delay() -> u64 {
     150 // TypeScript FLIP_ACTION_DELAY
 }
 
+fn default_command_delay_ms() -> u64 {
+    500
+}
+
 fn default_bed_spam_click_delay() -> u64 {
     100
 }
@@ -168,6 +178,7 @@ impl Default for Config {
             websocket_url: default_websocket_url(),
             web_gui_port: default_web_gui_port(),
             flip_action_delay: default_flip_action_delay(),
+            command_delay_ms: default_command_delay_ms(),
             bed_spam_click_delay: default_bed_spam_click_delay(),
             bed_multiple_clicks_delay: 0,
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
