@@ -846,132 +846,77 @@ async fn main() -> Result<()> {
     // Spawn command processor
     let command_queue_processor = command_queue.clone();
     let bot_client_clone = bot_client.clone();
+    let bazaar_flips_paused_proc = bazaar_flips_paused.clone();
+    let command_delay_ms = config.command_delay_ms;
     tokio::spawn(async move {
+        use frikadellen_baf::types::BotState;
         loop {
             // Process commands from queue
             if let Some(cmd) = command_queue_processor.start_current() {
                 debug!("Processing command: {:?}", cmd.command_type);
-                
+
+                // Bazaar-related commands are silently dropped while the AH flip window
+                // is active (bazaar_flips_paused = true). This covers BazaarBuyOrder,
+                // BazaarSellOrder, and ManageOrders.
+                let is_bazaar_related = matches!(
+                    cmd.command_type,
+                    frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
+                    | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
+                    | frikadellen_baf::types::CommandType::ManageOrders
+                );
+                if is_bazaar_related && bazaar_flips_paused_proc.load(Ordering::Relaxed) {
+                    debug!("[Queue] Dropping bazaar command {:?} — AH flip window active", cmd.command_type);
+                    command_queue_processor.complete_current();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+
                 // Send command to bot for execution
                 if let Err(e) = bot_client_clone.send_command(cmd.clone()) {
                     warn!("Failed to send command to bot: {}", e);
                 }
-                
-                // Wait for command to be processed.
-                // For claim commands, poll until the bot leaves the claiming state (up to 30s).
-                // For bazaar commands, poll until the bot leaves the Bazaar state (up to 20s).
-                // For other commands, wait a fixed 5 seconds.
-                let is_claim = matches!(
-                    cmd.command_type,
+
+                // Per-command-type timeout: how long to wait for the bot to leave the
+                // busy state before declaring it stuck and forcing a reset.
+                let timeout_secs: u64 = match cmd.command_type {
                     frikadellen_baf::types::CommandType::ClaimPurchasedItem
                     | frikadellen_baf::types::CommandType::ClaimSoldItem
-                );
-                let is_bazaar = matches!(
-                    cmd.command_type,
+                    | frikadellen_baf::types::CommandType::CheckCookie
+                    | frikadellen_baf::types::CommandType::ManageOrders => 60,
                     frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
-                    | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
-                );
-                let is_selling = matches!(
-                    cmd.command_type,
-                    frikadellen_baf::types::CommandType::SellToAuction { .. }
-                );
-                let is_cookie = matches!(
-                    cmd.command_type,
-                    frikadellen_baf::types::CommandType::CheckCookie
-                );
-                let is_manage_orders = matches!(
-                    cmd.command_type,
-                    frikadellen_baf::types::CommandType::ManageOrders
-                );
-                if is_claim {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    loop {
-                        sleep(Duration::from_millis(250)).await;
-                        let s = bot_client_clone.state();
-                        if !matches!(s,
-                            frikadellen_baf::types::BotState::ClaimingPurchased
-                            | frikadellen_baf::types::BotState::ClaimingSold
-                        ) || std::time::Instant::now() >= deadline {
-                            break;
-                        }
+                    | frikadellen_baf::types::CommandType::BazaarSellOrder { .. } => 20,
+                    frikadellen_baf::types::CommandType::SellToAuction { .. } => 15,
+                    _ => 10,
+                };
+
+                // Poll until the bot returns to an allows_commands() state or we hit the
+                // per-type timeout. A single loop replaces the previous per-type if/else chain.
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(timeout_secs);
+                loop {
+                    sleep(Duration::from_millis(250)).await;
+                    if bot_client_clone.state().allows_commands()
+                        || std::time::Instant::now() >= deadline
+                    {
+                        break;
                     }
-                } else if is_bazaar {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-                    loop {
-                        sleep(Duration::from_millis(250)).await;
-                        let s = bot_client_clone.state();
-                        if s != frikadellen_baf::types::BotState::Bazaar
-                            || std::time::Instant::now() >= deadline
-                        {
-                            break;
-                        }
-                    }
-                    // Safety: if the flow got stuck and the bot is still in Bazaar state,
-                    // force it back to Idle so subsequent commands can run.
-                    if bot_client_clone.state() == frikadellen_baf::types::BotState::Bazaar {
-                        warn!("[BazaarOrder] Timed out waiting for bazaar order, resetting state to Idle");
-                        bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
-                    }
-                } else if is_selling {
-                    // Wait up to 15s for the full auction creation flow to complete
-                    // (matching TypeScript's 10s sellItem timeout with a small buffer)
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-                    loop {
-                        sleep(Duration::from_millis(250)).await;
-                        let s = bot_client_clone.state();
-                        if s != frikadellen_baf::types::BotState::Selling
-                            || std::time::Instant::now() >= deadline
-                        {
-                            break;
-                        }
-                    }
-                    // Safety: if the flow got stuck and the bot is still in Selling state,
-                    // force it back to Idle so subsequent commands can run.
-                    if bot_client_clone.state() == frikadellen_baf::types::BotState::Selling {
-                        warn!("[SellToAuction] Timed out waiting for auction creation, resetting state to Idle");
-                        bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
-                    }
-                } else if is_cookie {
-                    // Wait up to 30s for cookie check (and optional buy) to complete
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    loop {
-                        sleep(Duration::from_millis(250)).await;
-                        let s = bot_client_clone.state();
-                        if !matches!(s,
-                            frikadellen_baf::types::BotState::CheckingCookie
-                            | frikadellen_baf::types::BotState::BuyingCookie
-                        ) || std::time::Instant::now() >= deadline {
-                            break;
-                        }
-                    }
-                    if matches!(bot_client_clone.state(),
-                        frikadellen_baf::types::BotState::CheckingCookie
-                        | frikadellen_baf::types::BotState::BuyingCookie
-                    ) {
-                        warn!("[Cookie] Timed out waiting for cookie check, resetting state to Idle");
-                        bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
-                    }
-                } else if is_manage_orders {
-                    // Wait up to 60s for order management to complete
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    loop {
-                        sleep(Duration::from_millis(250)).await;
-                        let s = bot_client_clone.state();
-                        if s != frikadellen_baf::types::BotState::ManagingOrders
-                            || std::time::Instant::now() >= deadline
-                        {
-                            break;
-                        }
-                    }
-                    if bot_client_clone.state() == frikadellen_baf::types::BotState::ManagingOrders {
-                        warn!("[ManageOrders] Timed out waiting for order management, resetting state to Idle");
-                        bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
-                    }
-                } else {
-                    sleep(Duration::from_secs(5)).await;
                 }
-                
+
+                // Safety reset: if the bot is still in a busy state after the timeout,
+                // force it back to Idle so the queue can continue.
+                if !bot_client_clone.state().allows_commands() {
+                    warn!(
+                        "[Queue] Command {:?} timed out after {}s — forcing Idle",
+                        cmd.command_type, timeout_secs
+                    );
+                    bot_client_clone.set_state(BotState::Idle);
+                }
+
                 command_queue_processor.complete_current();
+
+                // Always wait the configurable inter-command delay so Hypixel interactions
+                // don't run back-to-back.
+                sleep(Duration::from_millis(command_delay_ms)).await;
             }
             
             // Small delay to prevent busy loop
