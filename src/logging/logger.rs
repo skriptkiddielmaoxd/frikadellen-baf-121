@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 pub fn init_logger() -> Result<()> {
     let logs_dir = get_logs_dir();
@@ -32,6 +32,7 @@ pub fn init_logger() -> Result<()> {
                 .with_writer(std::io::stdout)
                 .with_ansi(true)
                 .with_target(false)
+                .with_filter(LevelFilter::WARN)
         )
         .with(
             fmt::layer()
