@@ -46,8 +46,7 @@ impl ConfigLoader {
         let contents = fs::read_to_string(&self.config_path)
             .context("Failed to read config file")?;
         
-        let config: Config = toml::from_str(&contents)
-            .context("Failed to parse config file")?;
+        let config = Self::parse_config(&contents)?;
         
         // Merge any missing fields from defaults into the loaded config
         // (matches TypeScript initConfigHelper: "add new default values to existing config
@@ -57,6 +56,19 @@ impl ConfigLoader {
         
         info!("Loaded configuration from {:?}", self.config_path);
         Ok(config)
+    }
+
+    fn parse_config(contents: &str) -> Result<Config> {
+        let mut value: toml::Value = toml::from_str(contents)
+            .context("Failed to parse config file")?;
+
+        if let Some(table) = value.as_table_mut() {
+            if table.contains_key("fastbuy") && table.contains_key("confirm_skip") {
+                table.remove("confirm_skip");
+            }
+        }
+
+        value.try_into().context("Failed to parse config file")
     }
 
     pub fn save(&self, config: &Config) -> Result<()> {
@@ -84,6 +96,18 @@ impl ConfigLoader {
         updater(&mut config);
         self.save(&config)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigLoader;
+
+    #[test]
+    fn parse_config_allows_fastbuy_and_confirm_skip_together() {
+        let config = ConfigLoader::parse_config("fastbuy = true\nconfirm_skip = false")
+            .expect("config should parse");
+        assert!(config.fastbuy_enabled());
     }
 }
 
