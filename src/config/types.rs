@@ -54,7 +54,7 @@ pub struct Config {
 
     /// Enable fastbuy (window-skip): click BIN buy (slot 31) and pre-click confirm (slot 11).
     /// Disabled by default and omitted from generated config unless manually added.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "confirm_skip")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fastbuy: Option<bool>,
     
     #[serde(default = "default_true")]
@@ -252,8 +252,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_confirm_skip_maps_to_fastbuy() {
+    fn confirm_skip_does_not_enable_fastbuy() {
         let config: Config = toml::from_str("confirm_skip = true").expect("config should parse");
-        assert!(config.fastbuy_enabled());
+        assert!(!config.fastbuy_enabled());
     }
 }
