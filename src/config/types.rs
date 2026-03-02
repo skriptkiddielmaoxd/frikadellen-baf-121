@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_skip_is_ignored() {
+    fn confirm_skip_does_not_enable_fastbuy() {
         let config: Config = toml::from_str("confirm_skip = true").expect("config should parse");
         assert!(!config.fastbuy_enabled());
     }

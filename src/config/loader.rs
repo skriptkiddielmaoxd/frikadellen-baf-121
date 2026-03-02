@@ -98,7 +98,7 @@ mod tests {
     use super::ConfigLoader;
 
     #[test]
-    fn parse_config_ignores_confirm_skip() {
+    fn parse_config_does_not_map_confirm_skip_to_fastbuy() {
         let config = ConfigLoader::parse_config("confirm_skip = true")
             .expect("config should parse");
         assert!(!config.fastbuy_enabled());
