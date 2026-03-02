@@ -39,6 +39,9 @@ const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
 /// Delay before clicking accept button in trade response window (milliseconds)
 /// TypeScript waits to check for "Deal!" or "Warning!" messages before accepting
 const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
+const FASTBUY_PRECLICK_DELAY_MS: u64 = 35;
+const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
+const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
 
 /// Main bot client wrapper for Azalea
 /// 
@@ -1928,10 +1931,15 @@ async fn handle_window_interaction(
                     // Optional fastbuy (window-skip): pre-click confirm in the next window.
                     // If this packet is ignored/lost, the Confirm Purchase handler below still
                     // performs normal confirm clicks with retries.
-                    if state.fastbuy && slot_31_kind.contains("gold_nugget") {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(35)).await;
-                        if *state.last_window_id.read() == window_id {
-                            let next_window_id = window_id.wrapping_add(1);
+                    if state.fastbuy && slot_31_kind.contains(BIN_PURCHASE_ITEM_KIND) {
+                        // Small pre-click delay to let the slot-31 buy packet reach the server
+                        // before we send the next-window confirm packet.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(FASTBUY_PRECLICK_DELAY_MS)).await;
+                        let observed_window_id = *state.last_window_id.read();
+                        if observed_window_id == window_id {
+                            // Hypixel's confirm GUI for this click is the next container id.
+                            // wrapping_add handles the u8 id rollover safely.
+                            let next_window_id = observed_window_id.wrapping_add(1);
                             click_window_slot(bot, next_window_id, 11).await;
                         }
                     }
@@ -3122,7 +3130,8 @@ async fn run_startup_workflow(
 ) {
     // Do not run startup steps while another interactive flow is active.
     // Wait briefly for idle/grace period; abort if the bot stays busy.
-    let entry_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+    let entry_deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(STARTUP_ENTRY_TIMEOUT_SECS);
     loop {
         let current_state = *bot_state.read();
         if matches!(current_state, BotState::GracePeriod | BotState::Idle) {
@@ -3139,8 +3148,8 @@ async fn run_startup_workflow(
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
 
-    // If another queued command starts while startup is running, abort startup to avoid
-    // overlapping GUI/chat actions (e.g. /ah sell flow colliding with /sbmenu or /bz).
+    // Snapshot command generation at workflow entry. If this value changes, execute_command
+    // has started a new queued command and startup must abort to avoid overlapping GUI flows.
     let startup_generation = command_generation.load(Ordering::SeqCst);
 
     info!("╔══════════════════════════════════════╗");
