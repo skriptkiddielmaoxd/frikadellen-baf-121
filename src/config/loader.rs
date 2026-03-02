@@ -68,7 +68,7 @@ impl ConfigLoader {
             }
         }
 
-        value.try_into().context("Failed to parse config file")
+        value.try_into().context("Failed to deserialize config file")
     }
 
     pub fn save(&self, config: &Config) -> Result<()> {
@@ -104,10 +104,18 @@ mod tests {
     use super::ConfigLoader;
 
     #[test]
-    fn parse_config_allows_fastbuy_and_confirm_skip_together() {
+    fn parse_config_prefers_fastbuy_over_confirm_skip() {
+        let config = ConfigLoader::parse_config("confirm_skip = true")
+            .expect("config should parse");
+        assert!(config.fastbuy_enabled());
+
         let config = ConfigLoader::parse_config("fastbuy = true\nconfirm_skip = false")
             .expect("config should parse");
         assert!(config.fastbuy_enabled());
+
+        let config = ConfigLoader::parse_config("fastbuy = false\nconfirm_skip = true")
+            .expect("config should parse");
+        assert!(!config.fastbuy_enabled());
     }
 }
 
