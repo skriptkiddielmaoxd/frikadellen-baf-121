@@ -48,6 +48,13 @@ fn format_coins(amount: i64) -> String {
     if negative { format!("-{}", formatted) } else { formatted }
 }
 
+fn is_ban_disconnect(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("temporarily banned")
+        || lower.contains("permanently banned")
+        || lower.contains("ban id:")
+}
+
 /// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
 /// buy_price is 0 until ItemPurchased fires and updates it.
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
@@ -250,6 +257,16 @@ async fn main() -> Result<()> {
                 }
                 frikadellen_baf::bot::BotEvent::Disconnected(reason) => {
                     warn!("Bot disconnected: {}", reason);
+                    if is_ban_disconnect(&reason) {
+                        if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                            let url = webhook_url.to_string();
+                            let name = ingame_name_for_events.clone();
+                            let ban_reason = reason.clone();
+                            tokio::spawn(async move {
+                                frikadellen_baf::webhook::send_webhook_banned(&name, &ban_reason, &url).await;
+                            });
+                        }
+                    }
                 }
                 frikadellen_baf::bot::BotEvent::Kicked(reason) => {
                     warn!("Bot kicked: {}", reason);
@@ -1184,3 +1201,27 @@ async fn main() -> Result<()> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::is_ban_disconnect;
+
+    #[test]
+    fn detects_temporary_ban_disconnect() {
+        assert!(is_ban_disconnect("You are temporarily banned for 29d from this server!"));
+    }
+
+    #[test]
+    fn detects_ban_id_disconnect() {
+        assert!(is_ban_disconnect("Disconnect reason ... Ban ID: #692672FA"));
+    }
+
+    #[test]
+    fn detects_permanent_ban_disconnect() {
+        assert!(is_ban_disconnect("You are permanently banned from this server!"));
+    }
+
+    #[test]
+    fn ignores_non_ban_disconnect() {
+        assert!(!is_ban_disconnect("Disconnected: Timed out"));
+    }
+}

@@ -405,3 +405,23 @@ pub async fn send_webhook_auction_listed(
     });
     post_embed(webhook_url, payload).await;
 }
+
+pub async fn send_webhook_banned(
+    ingame_name: &str,
+    reason: &str,
+    webhook_url: &str,
+) {
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "⛔ Bot Banned / Disconnected",
+            "description": format!("**{}** appears to be banned.\n\n```{}```", ingame_name, reason),
+            "color": 0xe74c3cu32,
+            "footer": {
+                "text": format!("BAF - {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            },
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}

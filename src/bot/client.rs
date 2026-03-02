@@ -2917,28 +2917,17 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             let nbt_data = if let Some(item_data) = item.as_present() {
                 match serde_json::to_value(item_data) {
                     Ok(value) => {
-                        let mut components = value
+                        value
                             .as_object()
                             .and_then(|obj| obj.get("components").cloned())
-                            .unwrap_or(serde_json::Value::Null);
-                        // Remove minecraft:profile (player-head texture data) from the NBT
-                        // sent to COFL.  Drills and other player_head items carry large base64
-                        // texture payloads in this component; including it can cause COFL's
-                        // inventory parser to reject the slot or the whole inventory, breaking
-                        // listing of other items.  COFL identifies items via
-                        // minecraft:custom_data (ExtraAttributes) which is always retained.
-                        if let Some(obj) = components.as_object_mut() {
-                            obj.remove("minecraft:profile");
-                        }
-                        components
+                            .unwrap_or(serde_json::Value::Null)
                     }
                     Err(_) => serde_json::Value::Null,
                 }
             } else {
                 serde_json::Value::Null
             };
-            let item_name = get_item_display_name_from_slot(item)
-                .unwrap_or_else(|| item.kind().to_string());
+            let item_name = item.kind().to_string();
             slot_descriptions.push(format!("slot {}: {}x {}", mineflayer_slot, item.count(), item_name));
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
@@ -2955,8 +2944,6 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
 
     let inventory_json = serde_json::json!({
         "id": 0,
-        "type": "SKYBLOCK_MENU",
-        "title": "Inventory",
         "slots": slots_array,
         "inventoryStart": 9,
         "inventoryEnd": 45,
