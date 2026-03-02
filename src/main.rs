@@ -1216,6 +1216,11 @@ mod tests {
     }
 
     #[test]
+    fn detects_permanent_ban_disconnect() {
+        assert!(is_ban_disconnect("You are permanently banned from this server!"));
+    }
+
+    #[test]
     fn ignores_non_ban_disconnect() {
         assert!(!is_ban_disconnect("Disconnected: Timed out"));
     }
