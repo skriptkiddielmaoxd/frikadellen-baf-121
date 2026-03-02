@@ -59,14 +59,8 @@ impl ConfigLoader {
     }
 
     fn parse_config(contents: &str) -> Result<Config> {
-        let mut value: toml::Value = toml::from_str(contents)
+        let value: toml::Value = toml::from_str(contents)
             .context("Failed to parse config file")?;
-
-        if let Some(table) = value.as_table_mut() {
-            if table.contains_key("fastbuy") && table.contains_key("confirm_skip") {
-                table.remove("confirm_skip");
-            }
-        }
 
         value.try_into().context("Failed to deserialize config file")
     }
@@ -104,10 +98,10 @@ mod tests {
     use super::ConfigLoader;
 
     #[test]
-    fn parse_config_prefers_fastbuy_over_confirm_skip() {
+    fn parse_config_ignores_confirm_skip() {
         let config = ConfigLoader::parse_config("confirm_skip = true")
             .expect("config should parse");
-        assert!(config.fastbuy_enabled());
+        assert!(!config.fastbuy_enabled());
 
         let config = ConfigLoader::parse_config("fastbuy = true\nconfirm_skip = false")
             .expect("config should parse");
