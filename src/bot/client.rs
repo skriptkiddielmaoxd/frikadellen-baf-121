@@ -1151,7 +1151,7 @@ async fn event_handler(
                     if !already_active {
                         let bot_clone = bot.clone();
                         let window_id = *state.last_window_id.read();
-                        let last_window_id = state.last_window_id.clone();
+                        let shared_window_id = state.last_window_id.clone();
                         let bot_state = state.bot_state.clone();
                         let spam_flag = state.grace_period_spam_active.clone();
                         info!("[AH] Grace period detected — starting bed spam ({} ms interval)", 100);
@@ -1161,8 +1161,8 @@ async fn event_handler(
                             let mut failed_clicks: usize = 0;
                             loop {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
-                                let current_window_id = *last_window_id.read();
-                                if !is_grace_period_window_unchanged(window_id, current_window_id) {
+                                let current_window_id = *shared_window_id.read();
+                                if current_window_id != window_id {
                                     info!(
                                         "[AH] Grace period spam: window changed ({} -> {}), stopping",
                                         window_id, current_window_id
@@ -1185,11 +1185,7 @@ async fn event_handler(
                                     // Grace period may still be active — keep clicking.
                                     // Reset failed counter: slot is correct, just waiting.
                                     failed_clicks = 0;
-                                    if is_grace_period_window_unchanged(window_id, *last_window_id.read()) {
-                                        click_window_slot(&bot_clone, window_id, 31).await;
-                                    } else {
-                                        break;
-                                    }
+                                    click_window_slot(&bot_clone, window_id, 31).await;
                                 } else {
                                     failed_clicks += 1;
                                     debug!("[AH] Grace period spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
@@ -3334,11 +3330,6 @@ fn extract_viewauction_uuid(msg: &str) -> Option<String> {
     if uuid.is_empty() { None } else { Some(uuid) }
 }
 
-#[inline]
-fn is_grace_period_window_unchanged(expected_window_id: u8, current_window_id: u8) -> bool {
-    expected_window_id == current_window_id
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3375,12 +3366,6 @@ mod tests {
     fn test_remove_mc_colors() {
         assert_eq!(remove_mc_colors("§aHello §r§bWorld"), "Hello World");
         assert_eq!(remove_mc_colors("No colors"), "No colors");
-    }
-
-    #[test]
-    fn test_is_grace_period_window_unchanged() {
-        assert!(is_grace_period_window_unchanged(1, 1));
-        assert!(!is_grace_period_window_unchanged(1, 2));
     }
 
     #[test]
